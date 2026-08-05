@@ -1,24 +1,10 @@
-# MongoDB Accessor API
+## tools
 
-FastAPIとMongoDBを接続する非同期CRUD APIです。
+### query_pc
 
-MongoDBを起動したうえで、Python 3.9以降を用意してください。
+## coco.py の認証設定
 
-```bash
-cp .env.example .env
-python3.9 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 3800
-```
-
-APIは `http://localhost:3800`、Swagger UIは `http://localhost:3800/docs` です。
-
-MongoDBが別ホストの場合は、`.env` の `MONGODB_URI` を接続先に変更します。
-
-## agent_api.py の認証設定
-
-`agent_api.py` は DokuWiki 接続に以下の環境変数を必要とします。`.env.example` を参照して実行環境に設定してください。`.env` は Git の追跡対象外です。
+`coco.py` は DokuWiki 接続に以下の環境変数を必要とします。`.env.example` を参照して実行環境に設定してください。`.env` は Git の追跡対象外です。
 
 | Variable | Description |
 | --- | --- |
@@ -46,3 +32,9 @@ MongoDBが別ホストの場合は、`.env` の `MONGODB_URI` を接続先に変
   "content": "Knowledge document"
 }
 ```
+
+# else
+
+## sitry
+
+192.168.10.8:1564でaccessできるChroma accessor．
