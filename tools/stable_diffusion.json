@@ -1,0 +1,16 @@
+{
+    "type": "function",
+    "function": {
+        "name": "generate_image",
+        "description": "Generate an image from text",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string"
+                }
+            },
+            "required": ["prompt"]
+        }
+    }
+}

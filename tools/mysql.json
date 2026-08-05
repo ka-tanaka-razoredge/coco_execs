@@ -1,0 +1,16 @@
+{
+  "type": "function",
+  "function": {
+    "name": "query_mysql",
+    "description": "Execute SQL query",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": ["query"]
+    }
+  }
+}

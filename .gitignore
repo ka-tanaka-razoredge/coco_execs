@@ -1,0 +1,11 @@
+.env
+knowledge
+.venv/
+__pycache__/
+*.pyc
+generated/
+
+# OS/editor artifacts
+.DS_Store
+Thumbs.db
+README.md:Zone.Identifier
