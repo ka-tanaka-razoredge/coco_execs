@@ -2,6 +2,8 @@
 
 ### query_pc
 
+192.168.10.8:1564で提供されているsitryを介してDatabase pcへaccessする．
+
 ## coco.py の認証設定
 
 `coco.py` は DokuWiki 接続に以下の環境変数を必要とします。`.env.example` を参照して実行環境に設定してください。`.env` は Git の追跡対象外です。
@@ -37,4 +39,4 @@
 
 ## sitry
 
-192.168.10.8:1564でaccessできるChroma accessor．
+192.168.10.8:1564でaccessできる．

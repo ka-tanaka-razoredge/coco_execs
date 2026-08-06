@@ -7,6 +7,8 @@ import requests
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlparse
+from requests.utils import requote_uri
 
 import yaml
 
@@ -26,6 +28,22 @@ RAG_RESULT_LIMIT = 5
 KNOWLEDGE_DIR = Path(__file__).resolve().parent / "knowledge"
 RAG_COLLECTIONS = ("knowledge", "preferences")
 MAX_WEB_SEARCH_STEPS = 3
+MEDIA_EXTENSIONS = {
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".gif": "image",
+    ".webp": "image",
+    ".bmp": "image",
+    ".svg": "image",
+    ".mp4": "video",
+    ".webm": "video",
+    ".mov": "video",
+    ".mp3": "audio",
+    ".wav": "audio",
+    ".m4a": "audio",
+    ".ogg": "audio",
+}
 
 wiki_it: WikiIt | None = None
 
@@ -268,6 +286,238 @@ class AskRequest(BaseModel):
     query: str
 
 
+def extract_urls(text: str) -> list[str]:
+    urls = []
+    seen = set()
+
+    strict_urls = re.findall(r"https?://[^\s)\]>'\"]+", text)
+    for url in strict_urls:
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+
+    media_extensions = "|".join(ext.lstrip(".") for ext in MEDIA_EXTENSIONS)
+    media_url_pattern = re.compile(
+        rf"https?://.+?\.({media_extensions})(?:\?[^\s)\]>'\"]*)?",
+        flags=re.IGNORECASE,
+    )
+    for match in media_url_pattern.finditer(text):
+        url = match.group(0).strip(" \t\r\n\"'.,。")
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+
+    return urls
+
+
+def classify_media_url(url: str) -> str | None:
+    parsed_path = urlparse(url).path.lower()
+    for extension, media_type in MEDIA_EXTENSIONS.items():
+        if parsed_path.endswith(extension):
+            return media_type
+    return None
+
+
+def looks_like_display_request(text: str) -> bool:
+    lowered = text.lower()
+    keywords = (
+        "display",
+        "show",
+        "view",
+        "open",
+        "render",
+        "embed",
+        "表示",
+        "見せ",
+        "開い",
+        "画像",
+        "写真",
+        "プレビュー",
+        "preview",
+        "見たい",
+        "見せて",
+        "表示して",
+    )
+    return any(keyword in lowered for keyword in keywords)
+
+
+def is_media_url_focused_request(text: str, urls: list[str]) -> bool:
+    if not urls:
+        return False
+
+    stripped = text
+    for url in urls:
+        stripped = stripped.replace(url, " ")
+
+    # If most of the message is just a media URL (+short helper words), handle directly.
+    short_tokens = re.findall(r"[A-Za-z0-9_一-龯ぁ-んァ-ンー]+", stripped)
+    return len(short_tokens) <= 8
+
+
+def looks_like_media_refusal(answer: str) -> bool:
+    lowered = answer.lower()
+    patterns = (
+        "unable to display",
+        "can't display",
+        "cannot display",
+        "i cannot display",
+        "i can't display",
+        "unable to render",
+        "画像を表示でき",
+        "表示できません",
+        "not a url",
+        "this is a file path",
+        "file path, not a url",
+        "cannot be displayed directly",
+        "cannot display directly",
+        "is a file path",
+        "urlではありません",
+        "ファイルパス",
+        "text-based ai",
+        "cannot display images",
+        "can't display images",
+        "cannot view images",
+        "can't view images",
+        "cannot show images",
+        "can't show images",
+        "i am a text-based ai",
+        "i'm a text-based ai",
+        "i am text based ai",
+        "i'm text based ai",
+        "画像を見られ",
+        "画像を表示できない",
+        "can't display images directly",
+        "cannot display images directly",
+        "path to a file on a file server",
+        "file on a file server",
+        "provide you with information about the image",
+    )
+    if any(pattern in lowered for pattern in patterns):
+        return True
+
+    negative_phrases = (
+        "cannot",
+        "can't",
+        "unable",
+        "できません",
+        "不可",
+    )
+    media_terms = (
+        "image",
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "screenshot",
+        "画像",
+    )
+    return any(neg in lowered for neg in negative_phrases) and any(
+        term in lowered for term in media_terms
+    )
+
+
+def verify_media_url(url: str, expected_media_type: str) -> tuple[bool, str | None]:
+    safe_url = requote_uri(url)
+
+    try:
+        response = requests.head(safe_url, allow_redirects=True, timeout=6)
+        content_type = response.headers.get("content-type", "").lower()
+        if content_type.startswith(f"{expected_media_type}/"):
+            return True, content_type
+        if response.status_code >= 400:
+            return False, content_type or None
+    except requests.RequestException:
+        pass
+
+    try:
+        response = requests.get(safe_url, stream=True, timeout=8)
+        content_type = response.headers.get("content-type", "").lower()
+        response.close()
+        if response.status_code >= 400:
+            return False, content_type or None
+        if content_type.startswith(f"{expected_media_type}/"):
+            return True, content_type
+        return True, content_type or None
+    except requests.RequestException:
+        return False, None
+
+
+def build_media_answer(url: str, media_type: str, accessible: bool, content_type: str | None) -> str:
+    safe_url = requote_uri(url)
+
+    if not accessible:
+        return (
+            f"I could not access this {media_type} URL from the current environment: {safe_url}\n"
+            "Please check network reachability or permissions."
+        )
+
+    if media_type == "image":
+        return (
+            f"The image URL is reachable. Displaying it inline:\n\n"
+            f"<img src=\"{safe_url}\" alt=\"media\" style=\"max-width: 100%; height: auto;\" />\n\n"
+            f"Direct link: {safe_url}"
+        )
+
+    if media_type == "video":
+        return (
+            f"The video URL is reachable. Displaying it inline:\n\n"
+            f"<video controls style=\"max-width: 100%; height: auto;\">"
+            f"<source src=\"{safe_url}\" type=\"{content_type or 'video/mp4'}\" />"
+            f"Your browser does not support the video tag."
+            f"</video>\n\n"
+            f"Direct link: {safe_url}"
+        )
+
+    if media_type == "audio":
+        return (
+            f"The audio URL is reachable. Displaying it inline:\n\n"
+            f"<audio controls>"
+            f"<source src=\"{safe_url}\" type=\"{content_type or 'audio/mpeg'}\" />"
+            f"Your browser does not support the audio tag."
+            f"</audio>\n\n"
+            f"Direct link: {safe_url}"
+        )
+
+    return (
+        f"The {media_type} URL is reachable (content-type: {content_type or 'unknown'}).\n"
+        f"Direct link: {safe_url}"
+    )
+
+
+def try_handle_media_display_request(user_input: str) -> str | None:
+    urls = extract_urls(user_input)
+    if not urls:
+        return None
+
+    if not (looks_like_display_request(user_input) or is_media_url_focused_request(user_input, urls)):
+        return None
+
+    for url in urls:
+        media_type = classify_media_url(url)
+        if media_type is None:
+            continue
+
+        accessible, content_type = verify_media_url(url, media_type)
+        return build_media_answer(url, media_type, accessible, content_type)
+
+    return None
+
+
+def maybe_rewrite_media_refusal(user_input: str, answer: str) -> str:
+    if not answer or not looks_like_media_refusal(answer):
+        return answer
+
+    urls = extract_urls(user_input)
+    for url in urls:
+        media_type = classify_media_url(url)
+        if media_type is None:
+            continue
+        accessible, content_type = verify_media_url(url, media_type)
+        return build_media_answer(url, media_type, accessible, content_type)
+
+    return answer
+
+
 def call_llm(messages, tools=None):
     payload = {
         "model": MODEL,
@@ -325,6 +575,14 @@ def run_web_search_react(messages: list[dict], initial_message: dict) -> tuple[s
 @app.post("/ask")
 def ask(req: AskRequest):
     user_input = req.query
+    media_answer = try_handle_media_display_request(user_input)
+    if media_answer is not None:
+        return {
+            "tool": "media_preview",
+            "tool_result": {"handled": True},
+            "answer": media_answer,
+        }
+
     knowledge = retrieve_knowledge(user_input)
     messages = rag_messages(user_input, knowledge)
 
@@ -336,13 +594,15 @@ def ask(req: AskRequest):
     msg = res1["choices"][0]["message"]
 
     if not msg.get("tool_calls"):
-        return {"answer": msg.get("content", "")}
+        answer = maybe_rewrite_media_refusal(user_input, msg.get("content", ""))
+        return {"answer": answer}
 
     tool_call = msg["tool_calls"][0]
 
     tool_name = tool_call["function"]["name"]
     if tool_name == "web_search":
         final_answer, web_search_results = run_web_search_react(messages, msg)
+        final_answer = maybe_rewrite_media_refusal(user_input, final_answer)
         return {
             "tool": tool_name,
             "tool_result": web_search_results[-1],
@@ -365,6 +625,7 @@ def ask(req: AskRequest):
     ])
 
     final_answer = res2["choices"][0]["message"]["content"]
+    final_answer = maybe_rewrite_media_refusal(user_input, final_answer)
 
     return {
         "tool": tool_name,
