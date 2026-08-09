@@ -17,6 +17,7 @@ from tools.powershell import run_powershell
 from tools.web_search import search_web
 from tools.pc import call_pc
 from tools.wiki_it import WikiIt
+from tools.wiki_do import WikiDo, create_wiki_do, DEFAULT_WIKI_DO_URL
 
 app = FastAPI()
 
@@ -46,6 +47,7 @@ MEDIA_EXTENSIONS = {
 }
 
 wiki_it: WikiIt | None = None
+wiki_do_client: WikiDo | None = None
 
 
 def get_wiki_it() -> WikiIt:
@@ -67,6 +69,46 @@ def get_wiki_it() -> WikiIt:
         )
 
     return wiki_it
+
+
+def get_wiki_do() -> WikiDo:
+    global wiki_do_client
+
+    if wiki_do_client is None:
+        wiki_do_url = os.environ.get("WIKI_DO_URL") or DEFAULT_WIKI_DO_URL
+        wiki_do_client = create_wiki_do(url=wiki_do_url)
+
+    return wiki_do_client
+
+
+def handle_wiki_do(args: dict):
+    action = args.get("action")
+    if action == "get_page":
+        page = args.get("page")
+        if not page:
+            raise ValueError("page is required when action=get_page")
+        return get_wiki_do().get_page(page)
+
+    if action == "list_pages":
+        return get_wiki_do().list_pages()
+
+    if action == "search":
+        keyword = args.get("keyword")
+        if not keyword:
+            raise ValueError("keyword is required when action=search")
+        return get_wiki_do().search(keyword)
+
+    if action == "put_page":
+        page = args.get("page")
+        text = args.get("text")
+        if not page:
+            raise ValueError("page is required when action=put_page")
+        if text is None:
+            raise ValueError("text is required when action=put_page")
+        summary = args.get("summary") or ""
+        return get_wiki_do().put_page(page, text, summary)
+
+    raise ValueError("action must be one of: get_page, list_pages, search, put_page")
 
 
 def _search_terms(query: str) -> set[str]:
@@ -163,11 +205,31 @@ LLM_TOOL_LIST = [
       "type": "function",
       "function": {
           "name": "query_pc",
-          "description": "Query the PC information database.",
+          "description": "Query the PC information database. The query argument must be SQL and must start with SELECT or WITH. Never pass natural language.",
           "parameters": {
               "type": "object",
               "properties": {
-                  "query": {"type": "string"}
+                  "query": {
+                      "type": "string",
+                      "description": "Read-only SQL only. Must start with SELECT or WITH. Example: SELECT * FROM tags LIMIT 10"
+                  }
+              },
+              "required": ["query"]
+          }
+      }
+  },
+  {
+      "type": "function",
+      "function": {
+          "name": "sitri",
+          "description": "Alias of query_pc. The query argument must be SQL and must start with SELECT or WITH. Never pass natural language.",
+          "parameters": {
+              "type": "object",
+              "properties": {
+                  "query": {
+                      "type": "string",
+                      "description": "Read-only SQL only. Must start with SELECT or WITH. Example: SELECT * FROM tags LIMIT 10"
+                  }
               },
               "required": ["query"]
           }
@@ -205,7 +267,7 @@ LLM_TOOL_LIST = [
       "type": "function",
       "function": {
           "name": "get_wiki_it_page",
-          "description": "Get the text of a DokuWiki page.",
+          "description": "Get the full text of a known DokuWiki page from wiki_it. Use this only after the page name is known.",
           "parameters": {
               "type": "object",
               "properties": {
@@ -219,7 +281,7 @@ LLM_TOOL_LIST = [
       "type": "function",
       "function": {
           "name": "list_wiki_it_pages",
-          "description": "List all available DokuWiki pages.",
+          "description": "List available DokuWiki pages from wiki_it when you need to inspect candidates or namespace structure.",
           "parameters": {
               "type": "object",
               "properties": {}
@@ -230,13 +292,55 @@ LLM_TOOL_LIST = [
       "type": "function",
       "function": {
           "name": "search_wiki_it",
-          "description": "Search for DokuWiki pages containing a specific keyword.",
+          "description": "Search wiki_it DokuWiki pages by keyword when the page name is not known yet. After finding a candidate, call get_wiki_it_page to read it.",
           "parameters": {
               "type": "object",
               "properties": {
                   "keyword": {"type": "string"}
               },
               "required": ["keyword"]
+          }
+      }
+  },
+  {
+      "type": "function",
+      "function": {
+          "name": "wiki_do",
+          "description": "Access DokuWiki via wiki_do. If the page name is not known, call action=search first and then action=get_page for the best candidate. Use put_page only when the user explicitly asks to write. Supported actions: get_page, list_pages, search, put_page.",
+          "parameters": {
+              "type": "object",
+              "properties": {
+                  "action": {
+                      "type": "string",
+                      "enum": ["get_page", "list_pages", "search", "put_page"]
+                  },
+                  "page": {"type": "string"},
+                  "keyword": {"type": "string"},
+                  "text": {"type": "string"},
+                  "summary": {"type": "string"}
+              },
+              "required": ["action"]
+          }
+      }
+  },
+  {
+      "type": "function",
+      "function": {
+          "name": "miranda",
+          "description": "Alias of wiki_do. If the page name is not known, call action=search first and then action=get_page for the best candidate. Use put_page only when the user explicitly asks to write.",
+          "parameters": {
+              "type": "object",
+              "properties": {
+                  "action": {
+                      "type": "string",
+                      "enum": ["get_page", "list_pages", "search", "put_page"]
+                  },
+                  "page": {"type": "string"},
+                  "keyword": {"type": "string"},
+                  "text": {"type": "string"},
+                  "summary": {"type": "string"}
+              },
+              "required": ["action"]
           }
       }
   },
@@ -263,13 +367,30 @@ WEB_SEARCH_TOOL_LIST = [
     tool for tool in LLM_TOOL_LIST if tool["function"]["name"] == "web_search"
 ]
 
+WIKI_TOOL_NAMES = {
+    "get_wiki_it_page",
+    "list_wiki_it_pages",
+    "search_wiki_it",
+    "wiki_do",
+    "miranda",
+}
+
+WIKI_TOOL_LIST = [
+    tool for tool in LLM_TOOL_LIST if tool["function"]["name"] in WIKI_TOOL_NAMES
+]
+
+MAX_WIKI_TOOL_STEPS = 3
+
 TOOL_HANDLERS = {
     "query_pc": lambda args: call_pc(args["query"]),
+    "sitri": lambda args: call_pc(args["query"]),
     "generate_image": lambda args: generate_image(args["prompt"]),
     "run_powershell": lambda args: run_powershell(args["command"]),
     "get_wiki_it_page": lambda args: get_wiki_it().get_page(args["page"]),
     "list_wiki_it_pages": lambda args: get_wiki_it().list_pages(),
     "search_wiki_it": lambda args: get_wiki_it().search(args["keyword"]),
+    "wiki_do": lambda args: handle_wiki_do(args),
+    "miranda": lambda args: handle_wiki_do(args),
     "web_search": lambda args: search_web(args["query"]),
 }
 
@@ -279,7 +400,15 @@ def execute_tool(tool_name: str, args: dict):
         handler = TOOL_HANDLERS[tool_name]
     except KeyError as error:
         raise ValueError(f"Unknown tool: {tool_name}") from error
-    return handler(args)
+
+    try:
+        return handler(args)
+    except Exception as error:  # pragma: no cover - defensive wrapper
+        return {
+            "tool_name": tool_name,
+            "error": str(error),
+            "error_type": error.__class__.__name__,
+        }
 
 
 class AskRequest(BaseModel):
@@ -518,6 +647,37 @@ def maybe_rewrite_media_refusal(user_input: str, answer: str) -> str:
     return answer
 
 
+def suggest_read_only_sql(user_input: str) -> str:
+    match = re.search(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*から\s*(\d+)\s*件", user_input)
+    if match:
+        table = match.group(1)
+        limit = match.group(2)
+        return f"SELECT * FROM {table} LIMIT {limit}"
+
+    if "tags" in user_input.lower():
+        return "SELECT * FROM tags LIMIT 10"
+
+    return "SELECT * FROM <table_name> LIMIT 10"
+
+
+def build_tool_error_answer(user_input: str, tool_name: str, result: dict) -> str | None:
+    if not isinstance(result, dict):
+        return None
+
+    error = result.get("error")
+    if not error:
+        return None
+
+    if tool_name in ("query_pc", "sitri") and "Only read-only queries are allowed" in error:
+        sql_example = suggest_read_only_sql(user_input)
+        return (
+            "query_pc コマンドは SELECT / WITH で始まる参照系 SQL のみサポートしています。\n\n"
+            f"次のような SQL を渡してください: {sql_example}"
+        )
+
+    return f"{tool_name} の実行でエラーが発生しました: {error}"
+
+
 def call_llm(messages, tools=None):
     payload = {
         "model": MODEL,
@@ -530,20 +690,28 @@ def call_llm(messages, tools=None):
     return res.json()
 
 
-def run_web_search_react(messages: list[dict], initial_message: dict) -> tuple[str, list]:
+def run_tool_react(
+    messages: list[dict],
+    initial_message: dict,
+    *,
+    allowed_tool_names: set[str],
+    allowed_tools: list[dict],
+    max_steps: int,
+) -> tuple[str, list]:
     conversation = list(messages)
     message = initial_message
     results = []
 
-    for step in range(MAX_WEB_SEARCH_STEPS):
+    for step in range(max_steps):
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
             return message.get("content", ""), results
 
         tool_call = tool_calls[0]
         tool_name = tool_call["function"]["name"]
-        if tool_name != "web_search":
-            raise ValueError(f"Expected web_search, received: {tool_name}")
+        if tool_name not in allowed_tool_names:
+            allowed = ", ".join(sorted(allowed_tool_names))
+            raise ValueError(f"Expected one of [{allowed}], received: {tool_name}")
 
         args = json.loads(tool_call["function"]["arguments"])
         result = execute_tool(tool_name, args)
@@ -563,13 +731,33 @@ def run_web_search_react(messages: list[dict], initial_message: dict) -> tuple[s
             ]
         )
 
-        if step == MAX_WEB_SEARCH_STEPS - 1:
+        if step == max_steps - 1:
             final_response = call_llm(conversation)
         else:
-            final_response = call_llm(conversation, tools=WEB_SEARCH_TOOL_LIST)
+            final_response = call_llm(conversation, tools=allowed_tools)
         message = final_response["choices"][0]["message"]
 
     return message.get("content", ""), results
+
+
+def run_web_search_react(messages: list[dict], initial_message: dict) -> tuple[str, list]:
+    return run_tool_react(
+        messages,
+        initial_message,
+        allowed_tool_names={"web_search"},
+        allowed_tools=WEB_SEARCH_TOOL_LIST,
+        max_steps=MAX_WEB_SEARCH_STEPS,
+    )
+
+
+def run_wiki_tool_react(messages: list[dict], initial_message: dict) -> tuple[str, list]:
+    return run_tool_react(
+        messages,
+        initial_message,
+        allowed_tool_names=WIKI_TOOL_NAMES,
+        allowed_tools=WIKI_TOOL_LIST,
+        max_steps=MAX_WIKI_TOOL_STEPS,
+    )
 
 
 @app.post("/ask")
@@ -610,9 +798,27 @@ def ask(req: AskRequest):
             "answer": final_answer,
         }
 
+    if tool_name in WIKI_TOOL_NAMES:
+        final_answer, wiki_tool_results = run_wiki_tool_react(messages, msg)
+        final_answer = maybe_rewrite_media_refusal(user_input, final_answer)
+        return {
+            "tool": tool_name,
+            "tool_result": wiki_tool_results[-1],
+            "tool_results": wiki_tool_results,
+            "answer": final_answer,
+        }
+
     args = json.loads(tool_call["function"]["arguments"])
 
     result = execute_tool(tool_name, args)
+
+    tool_error_answer = build_tool_error_answer(user_input, tool_name, result)
+    if tool_error_answer is not None:
+        return {
+            "tool": tool_name,
+            "tool_result": result,
+            "answer": tool_error_answer,
+        }
 
 
     res2 = call_llm(messages + [
