@@ -6,6 +6,7 @@ import os
 import requests
 import json
 import re
+import logging
 from pathlib import Path
 from urllib.parse import urlparse
 from requests.utils import requote_uri
@@ -20,6 +21,7 @@ from tools.wiki_it import WikiIt
 from tools.wiki_do import WikiDo, create_wiki_do, DEFAULT_WIKI_DO_URL
 
 app = FastAPI()
+logger = logging.getLogger(__name__)
 
 LOCALAI_URL = "http://192.168.10.120:8823/v1/chat/completions"
 MODEL = "llama31"
@@ -686,8 +688,77 @@ def call_llm(messages, tools=None):
     if tools:
         payload["tools"] = tools
 
-    res = requests.post(LOCALAI_URL, json=payload)
-    return res.json()
+    try:
+        res = requests.post(LOCALAI_URL, json=payload, timeout=60)
+    except requests.RequestException as error:
+        logger.exception("LLM API request failed: %s", error)
+        return {
+            "_error": "LLM API request failed. Please check network connectivity and server availability."
+        }
+
+    raw_text = res.text
+    try:
+        response_json = res.json()
+    except ValueError:
+        logger.error(
+            "LLM API returned non-JSON response. status=%s body=%s",
+            res.status_code,
+            raw_text[:1000],
+        )
+        return {
+            "_error": f"LLM API returned a non-JSON response (status {res.status_code})."
+        }
+
+    if res.status_code >= 400:
+        logger.error(
+            "LLM API returned error status. status=%s body=%s",
+            res.status_code,
+            raw_text[:1000],
+        )
+        detail = response_json.get("error")
+        if isinstance(detail, dict):
+            detail = detail.get("message") or json.dumps(detail, ensure_ascii=False)
+        if not detail:
+            detail = response_json.get("detail") or "unknown error"
+        return {
+            "_error": f"LLM API returned status {res.status_code}: {detail}"
+        }
+
+    choices = response_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        logger.error(
+            "LLM API response missing choices. status=%s body=%s",
+            res.status_code,
+            raw_text[:1000],
+        )
+        return {
+            "_error": "LLM API response did not include choices. Please check upstream server logs."
+        }
+
+    return response_json
+
+
+def extract_assistant_message(response_json: dict) -> tuple[dict | None, str | None]:
+    if not isinstance(response_json, dict):
+        return None, "LLM API returned an unexpected response type."
+
+    error_message = response_json.get("_error")
+    if error_message:
+        return None, f"LLM 応答エラー: {error_message}"
+
+    choices = response_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None, "LLM 応答エラー: choices が含まれていません。"
+
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return None, "LLM 応答エラー: choices[0] の形式が不正です。"
+
+    message = first_choice.get("message")
+    if not isinstance(message, dict):
+        return None, "LLM 応答エラー: choices[0].message の形式が不正です。"
+
+    return message, None
 
 
 def run_tool_react(
@@ -735,7 +806,10 @@ def run_tool_react(
             final_response = call_llm(conversation)
         else:
             final_response = call_llm(conversation, tools=allowed_tools)
-        message = final_response["choices"][0]["message"]
+
+        message, llm_error = extract_assistant_message(final_response)
+        if llm_error is not None:
+            return llm_error, results
 
     return message.get("content", ""), results
 
@@ -779,7 +853,9 @@ def ask(req: AskRequest):
         tools=LLM_TOOL_LIST
     )
 
-    msg = res1["choices"][0]["message"]
+    msg, llm_error = extract_assistant_message(res1)
+    if llm_error is not None:
+        return {"answer": llm_error}
 
     if not msg.get("tool_calls"):
         answer = maybe_rewrite_media_refusal(user_input, msg.get("content", ""))
@@ -830,7 +906,15 @@ def ask(req: AskRequest):
         }
     ])
 
-    final_answer = res2["choices"][0]["message"]["content"]
+    res2_msg, llm_error = extract_assistant_message(res2)
+    if llm_error is not None:
+        return {
+            "tool": tool_name,
+            "tool_result": result,
+            "answer": llm_error,
+        }
+
+    final_answer = res2_msg.get("content", "")
     final_answer = maybe_rewrite_media_refusal(user_input, final_answer)
 
     return {
