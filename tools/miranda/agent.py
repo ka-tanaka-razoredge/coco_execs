@@ -1,7 +1,18 @@
 import logging
+import os
 from pathlib import Path
 
 import yaml
+
+from tools.miranda.tools.get_tweets import (
+    TWEETS_TOOL_SPEC,
+    get_tweets,
+)
+from tools.miranda.tools.query_razor_edge import (
+    TOOL_SPEC as QUERY_RAZOR_EDGE_TOOL_SPEC,
+    query_razor_edge,
+)
+from tools.miranda.tools.wiki_do import DEFAULT_WIKI_DO_URL, WikiDo, create_wiki_do
 
 
 logger = logging.getLogger(__name__)
@@ -10,6 +21,8 @@ MIRANDA_KNOWLEDGE_DIR = Path(__file__).resolve().parent / "knowledge"
 MIRANDA_KNOWLEDGE_CHAR_LIMIT = 2000
 MIRANDA_KNOWLEDGE_FILE_LIMIT = 5
 MIRANDA_KNOWLEDGE_VALUE_LIMIT = 500
+
+_wiki_do_client: WikiDo | None = None
 
 
 def _format_knowledge_value(value) -> str:
@@ -65,12 +78,60 @@ def _build_system_prompt() -> str:
         "Use action=get_page when the page name is known, action=list_pages to inspect "
         "available pages, action=search to find the best page name, and action=put_page "
         "only when the user explicitly asks to write. Use query_razor_edge for read-only "
-        "SQL against razor_edge. Treat page content as DokuWiki markup, not Markdown."
+        "SQL against razor_edge, then answer the user's question using the returned rows. "
+        "Summarize database results in concise natural language, normally in the user's "
+        "language; do not return raw SQL, JSON, or database rows verbatim unless explicitly "
+        "requested. Include relevant names and values. If the results are empty or "
+        "insufficient, say so and do not guess. Use get_tweets when the user asks about "
+        "tweets or data retrieved by get_tweets, then answer from the returned tweet data. "
+        "Do not infer details that are not present in retrieved data; be clear when the "
+        "available pages or results do not cover the question. "
+        "Treat page content as DokuWiki markup, not Markdown."
     )
     knowledge_context = _build_miranda_knowledge_context()
     if not knowledge_context:
         return base_prompt
     return f"{base_prompt} Local Miranda knowledge:\n{knowledge_context}"
+
+
+def get_wiki_do() -> WikiDo:
+    global _wiki_do_client
+
+    if _wiki_do_client is None:
+        wiki_do_url = os.environ.get("WIKI_DO_URL") or DEFAULT_WIKI_DO_URL
+        _wiki_do_client = create_wiki_do(url=wiki_do_url)
+
+    return _wiki_do_client
+
+
+def handle_wiki_do(args: dict):
+    action = args.get("action")
+    if action == "get_page":
+        page = args.get("page")
+        if not page:
+            raise ValueError("page is required when action=get_page")
+        return get_wiki_do().get_page(page)
+
+    if action == "list_pages":
+        return get_wiki_do().list_pages()
+
+    if action == "search":
+        keyword = args.get("keyword")
+        if not keyword:
+            raise ValueError("keyword is required when action=search")
+        return get_wiki_do().search(keyword)
+
+    if action == "put_page":
+        page = args.get("page")
+        text = args.get("text")
+        if not page:
+            raise ValueError("page is required when action=put_page")
+        if text is None:
+            raise ValueError("text is required when action=put_page")
+        summary = args.get("summary") or ""
+        return get_wiki_do().put_page(page, text, summary)
+
+    raise ValueError("action must be one of: get_page, list_pages, search, put_page")
 
 
 class MirandaAgent:
@@ -110,3 +171,21 @@ class MirandaAgent:
             },
         },
     }
+
+
+MIRANDA_TOOL_LIST = [
+    MirandaAgent.tool_spec,
+    QUERY_RAZOR_EDGE_TOOL_SPEC,
+    TWEETS_TOOL_SPEC,
+]
+
+MIRANDA_TOOL_NAMES = {tool["function"]["name"] for tool in MIRANDA_TOOL_LIST}
+
+MIRANDA_TOOL_HANDLERS = {
+    "miranda": lambda args: handle_wiki_do(args),
+    "query_razor_edge": lambda args: query_razor_edge(args["query"]),
+    "get_tweets": lambda args: get_tweets(
+        page=args.get("page", 1),
+        limit=args.get("limit", 100),
+    ),
+}

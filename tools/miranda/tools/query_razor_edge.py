@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from html import unescape
 
 import requests
 
@@ -19,7 +20,9 @@ TOOL_SPEC = {
         "description": (
             "Execute a read-only SQL query against razor_edge via "
             "https://razor-edge.net/gold/razor_edge/query. The query argument must be SQL "
-            "and must start with SELECT or WITH. Never pass natural language."
+            "and must start with SELECT or WITH. Never pass natural language. Use the "
+            "returned data to answer the user's question; do not present raw results unless "
+            "the user explicitly asks for them."
         ),
         "parameters": {
             "type": "object",
@@ -69,6 +72,28 @@ def _without_api_key_headers(headers: dict[str, str]) -> dict[str, str]:
         for key, value in headers.items()
         if key.lower() not in {"x-api-key", "api-key"}
     }
+
+
+def _extract_login_form_fields(html_text: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+
+    patterns = (
+        r'<input[^>]+name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\'][^>]*>',
+        r'<input[^>]+value=["\']([^"\']*)["\'][^>]*name=["\']([^"\']+)["\'][^>]*>',
+    )
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, html_text, flags=re.IGNORECASE | re.DOTALL):
+            groups = match.groups()
+            if len(groups) != 2:
+                continue
+            if pattern.startswith("<input[^>]+name"):
+                name, value = groups
+            else:
+                value, name = groups
+            fields[unescape(name)] = unescape(value)
+
+    return fields
 
 
 def _extract_token_from_response(response) -> str | None:
@@ -167,14 +192,33 @@ def _query_with_apache_and_cakephp_session(
     session.headers.update(headers)
     session.auth = apache_basic
 
-    login_response = session.post(
+    login_page_response = session.get(
         DEFAULT_GOLD_LOGIN_URL,
-        data={
-            "data[User][username]": app_user,
-            "data[User][password]": app_password,
-        },
         timeout=30,
         allow_redirects=True,
+    )
+
+    if login_page_response.status_code >= 400:
+        logger.warning(
+            "CakePHP login page returned status %s; falling back",
+            login_page_response.status_code,
+        )
+        return None
+
+    login_fields = _extract_login_form_fields(login_page_response.text or "")
+    login_fields.update(
+        {
+            "data[User][username]": app_user,
+            "data[User][password]": app_password,
+        }
+    )
+
+    login_response = session.post(
+        DEFAULT_GOLD_LOGIN_URL,
+        data=login_fields,
+        timeout=30,
+        allow_redirects=True,
+        headers={"Referer": DEFAULT_GOLD_LOGIN_URL},
     )
 
     if login_response.status_code >= 400:
@@ -205,6 +249,7 @@ def query_razor_edge(query: str):
     app_user, app_password = _resolve_app_credentials()
     apache_basic_user, apache_basic_password = _resolve_apache_basic_credentials()
     andy_token = None
+    session_flow_http_error: requests.HTTPError | None = None
 
     if (
         apache_basic_user
@@ -221,12 +266,30 @@ def query_razor_edge(query: str):
                 app_password=app_password,
             )
             if response is not None:
-                if response.status_code != 401:
-                    response.raise_for_status()
-                    return response.json()
-                logger.warning("query_razor_edge unauthorized with mode=apache_basic_plus_cakephp_session")
+                if response.status_code == 401:
+                    logger.warning("query_razor_edge unauthorized with mode=apache_basic_plus_cakephp_session")
+                else:
+                    try:
+                        response.raise_for_status()
+                    except requests.HTTPError as error:
+                        status = getattr(response, "status_code", "unknown")
+                        body = (getattr(response, "text", "") or "")[:500]
+                        message = (
+                            f"apache_basic_plus_cakephp_session returned status {status}. "
+                            f"response body: {body}"
+                        )
+                        session_flow_http_error = requests.HTTPError(message, response=response)
+                        logger.warning("query_razor_edge session flow returned non-auth error: %s", error)
+                    else:
+                        return response.json()
         except requests.RequestException as error:
-            logger.warning("query_razor_edge session flow failed: %s", error)
+            response = getattr(error, "response", None)
+            status = getattr(response, "status_code", None)
+            if status in (401, 403):
+                logger.warning("query_razor_edge session flow unauthorized: %s", error)
+            else:
+                logger.warning("query_razor_edge session flow failed with non-auth error: %s", error)
+                raise
 
     if andy_user and andy_password:
         try:
@@ -303,6 +366,8 @@ def query_razor_edge(query: str):
         return response.json()
 
     if last_unauthorized_response is not None:
+        if session_flow_http_error is not None:
+            raise session_flow_http_error
         raise requests.HTTPError(
             "401 Unauthorized for razor_edge/query. Tried dual-auth and token/basic/legacy auth (with and without API key). Check BASIC_AUTHORIZATION_*, ANDY_* credentials, and API key scope.",
             response=last_unauthorized_response,

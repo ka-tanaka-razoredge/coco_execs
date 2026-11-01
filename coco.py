@@ -14,8 +14,12 @@ from requests.utils import requote_uri
 import yaml
 
 from tools.stable_diffusion import generate_image
-from tools.miranda.agent import MirandaAgent
-from tools.miranda.tools.query_razor_edge import TOOL_SPEC as QUERY_RAZOR_EDGE_TOOL_SPEC, query_razor_edge
+from tools.miranda.agent import (
+    MIRANDA_TOOL_HANDLERS,
+    MIRANDA_TOOL_LIST as MIRANDA_AGENT_TOOL_LIST,
+    MIRANDA_TOOL_NAMES,
+    MirandaAgent,
+)
 from tools.powershell import run_powershell
 from tools.web_search import search_web
 from tools.pc import call_pc
@@ -25,7 +29,9 @@ from tools.miranda.tools.wiki_do import WikiDo, create_wiki_do, DEFAULT_WIKI_DO_
 app = FastAPI()
 logger = logging.getLogger(__name__)
 
-LOCALAI_URL = "http://192.168.10.120:8823/v1/chat/completions"
+LOCALAI_URL = os.environ.get(
+    "LOCALAI_URL", "http://localhost:8823/v1/chat/completions"
+)
 MODEL = "llama31"
 MONGODB_ACCESSOR_URL = "https://razor-edge.net/apis/mongodb-accessor"
 RAG_FETCH_LIMIT = 100
@@ -79,46 +85,6 @@ def get_wiki_it() -> WikiIt:
         )
 
     return wiki_it
-
-
-def get_wiki_do() -> WikiDo:
-    global wiki_do_client
-
-    if wiki_do_client is None:
-        wiki_do_url = os.environ.get("WIKI_DO_URL") or DEFAULT_WIKI_DO_URL
-        wiki_do_client = create_wiki_do(url=wiki_do_url)
-
-    return wiki_do_client
-
-
-def handle_wiki_do(args: dict):
-    action = args.get("action")
-    if action == "get_page":
-        page = args.get("page")
-        if not page:
-            raise ValueError("page is required when action=get_page")
-        return get_wiki_do().get_page(page)
-
-    if action == "list_pages":
-        return get_wiki_do().list_pages()
-
-    if action == "search":
-        keyword = args.get("keyword")
-        if not keyword:
-            raise ValueError("keyword is required when action=search")
-        return get_wiki_do().search(keyword)
-
-    if action == "put_page":
-        page = args.get("page")
-        text = args.get("text")
-        if not page:
-            raise ValueError("page is required when action=put_page")
-        if text is None:
-            raise ValueError("text is required when action=put_page")
-        summary = args.get("summary") or ""
-        return get_wiki_do().put_page(page, text, summary)
-
-    raise ValueError("action must be one of: get_page, list_pages, search, put_page")
 
 
 def _search_terms(query: str) -> set[str]:
@@ -215,13 +181,10 @@ def _compact_prompt_value(value, *, depth: int = 0):
         return compacted
 
     if isinstance(value, dict):
-        compacted = {}
-        for index, (key, item) in enumerate(value.items()):
-            if index >= RAG_PROMPT_LIST_LIMIT:
-                compacted["…"] = f"({len(value) - RAG_PROMPT_LIST_LIMIT} more keys)"
-                break
-            compacted[key] = _compact_prompt_value(item, depth=depth + 1)
-        return compacted
+        return {
+            key: _compact_prompt_value(item, depth=depth + 1)
+            for key, item in value.items()
+        }
 
     return value
 
@@ -512,23 +475,6 @@ LLM_TOOL_LIST = [
   {
       "type": "function",
       "function": {
-          "name": "query_razor_edge",
-          "description": "Execute a read-only SQL query against razor_edge via https://razor-edge.net/gold/razor_edge/query. The query argument must be SQL and must start with SELECT or WITH. Never pass natural language.",
-          "parameters": {
-              "type": "object",
-              "properties": {
-                  "query": {
-                      "type": "string",
-                      "description": "Read-only SQL only. Must start with SELECT or WITH. Example: SELECT * FROM tags LIMIT 10"
-                  }
-              },
-              "required": ["query"]
-          }
-      }
-  },
-  {
-      "type": "function",
-      "function": {
           "name": "get_wiki_it_page",
           "description": "Get the full text of a known DokuWiki page from wiki_it. The returned page uses DokuWiki markup, not standard Markdown. Use this only after the page name is known.",
           "parameters": {
@@ -586,8 +532,7 @@ LLM_TOOL_LIST = [
           }
       }
   },
-  MirandaAgent.tool_spec,
-    QUERY_RAZOR_EDGE_TOOL_SPEC,
+    *MIRANDA_AGENT_TOOL_LIST,
   {
       "type": "function",
       "function": {
@@ -623,10 +568,9 @@ WIKI_TOOL_LIST = [
     tool for tool in LLM_TOOL_LIST if tool["function"]["name"] in WIKI_TOOL_NAMES
 ]
 
-MIRANDA_TOOL_NAMES = WIKI_TOOL_NAMES | {"query_razor_edge"}
-
 MIRANDA_TOOL_LIST = [
-    tool for tool in LLM_TOOL_LIST if tool["function"]["name"] in MIRANDA_TOOL_NAMES
+    *WIKI_TOOL_LIST,
+    *MIRANDA_AGENT_TOOL_LIST,
 ]
 
 MAX_WIKI_TOOL_STEPS = 3
@@ -636,14 +580,13 @@ TOOL_HANDLERS = {
     "sitri": lambda args: call_pc(args["query"]),
     "generate_image": lambda args: generate_image(args["prompt"]),
     "run_powershell": lambda args: run_powershell(args["command"]),
-    "query_razor_edge": lambda args: query_razor_edge(args["query"]),
     "get_wiki_it_page": lambda args: get_wiki_it().get_page(args["page"]),
     "list_wiki_it_pages": lambda args: get_wiki_it().list_pages(),
     "search_wiki_it": lambda args: get_wiki_it().search(args["keyword"]),
-    "wiki_do": lambda args: handle_wiki_do(args),
-    "miranda": lambda args: handle_wiki_do(args),
     "web_search": lambda args: search_web(args["query"]),
 }
+
+TOOL_HANDLERS.update(MIRANDA_TOOL_HANDLERS)
 
 
 def execute_tool(tool_name: str, args: dict):
@@ -1084,7 +1027,7 @@ def run_wiki_tool_react(messages: list[dict], initial_message: dict) -> tuple[st
     return run_tool_react(
         messages,
         initial_message,
-        allowed_tool_names=MIRANDA_TOOL_NAMES,
+        allowed_tool_names=WIKI_TOOL_NAMES | MIRANDA_TOOL_NAMES,
         allowed_tools=MIRANDA_TOOL_LIST,
         max_steps=MAX_WIKI_TOOL_STEPS,
     )
